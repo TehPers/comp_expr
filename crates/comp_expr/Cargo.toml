@@ -1,0 +1,13 @@
+[package]
+name = "comp_expr"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+comp_expr_macros = { version = "0.1", path = "../comp_expr_macros" }
+
+[features]
+default = ["full"]
+full = ["seq"]
+seq = []
