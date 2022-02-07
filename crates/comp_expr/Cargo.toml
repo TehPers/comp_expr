@@ -9,5 +9,7 @@ comp_expr_macros = { version = "0.1", path = "../comp_expr_macros" }
 
 [features]
 default = ["full"]
-full = ["seq"]
+full = ["maybe", "seq", "parse"]
+maybe = []
 seq = []
+parse = []

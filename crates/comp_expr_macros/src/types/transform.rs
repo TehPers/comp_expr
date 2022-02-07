@@ -1,21 +1,26 @@
 use crate::{
     ext::OrError,
     types::{
-        CExprStmt, CExprStmts, DoBind, Else, ExecuteCExpr, For, FunctionDefs, If, LetBind, Loop,
-        Match, MatchArm, MatchArms, Return, ReturnBind, While, Yield, YieldBind,
+        BindModifiers, Braced, CExprStmt, CExprStmts, DelayModifiers, DoBind, Else, ExecuteCExpr,
+        For, FunctionDefs, If, LetBind, Loop, Match, MatchArm, MatchArms, Return, ReturnBind,
+        While, Yield, YieldBind,
     },
 };
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{spanned::Spanned, Stmt};
 
-use super::Braced;
-
 pub trait Transform {
+    fn is_cexpr(&self) -> bool;
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream>;
 }
 
 impl<T: Transform> Transform for Braced<T> {
+    fn is_cexpr(&self) -> bool {
+        self.inner.is_cexpr()
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         let inner = self.inner.transform(defs, then)?;
         let output = quote!({ #inner});
@@ -24,6 +29,10 @@ impl<T: Transform> Transform for Braced<T> {
 }
 
 impl Transform for Stmt {
+    fn is_cexpr(&self) -> bool {
+        false
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         let output = if !then.is_empty() {
             quote! {
@@ -49,6 +58,10 @@ impl Transform for Stmt {
 }
 
 impl Transform for LetBind {
+    fn is_cexpr(&self) -> bool {
+        true
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         // Get required definitions
         let bind = defs.bind.or_error(
@@ -60,12 +73,15 @@ impl Transform for LetBind {
         let value = self.value;
         let target = self.target;
         let ty = self.ty.as_ref().map(|(_, ty)| quote!(: #ty));
+        let closure = if bind.modifiers.contains(BindModifiers::MOVE) {
+            quote! { move |#target #ty| { #then } }
+        } else {
+            quote! { |#target #ty| { #then } }
+        };
         let output = quote! {
             (#bind)(
                 #value,
-                move |#target #ty| {
-                    #then
-                }
+                #closure
             )
         };
         Ok(output)
@@ -73,6 +89,10 @@ impl Transform for LetBind {
 }
 
 impl Transform for DoBind {
+    fn is_cexpr(&self) -> bool {
+        true
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         // Get required definitions
         let bind = defs.bind.or_error(
@@ -82,12 +102,15 @@ impl Transform for DoBind {
 
         // do?: impl Fn(M<T>, impl FnOnce() -> M<U>) -> M<U>
         let value = self.value;
+        let closure = if bind.modifiers.contains(BindModifiers::MOVE) {
+            quote! { move |_| { #then } }
+        } else {
+            quote! { |_| { #then } }
+        };
         let output = quote! {
             (#bind)(
                 #value,
-                move |_| {
-                    #then
-                }
+                #closure
             )
         };
         Ok(output)
@@ -95,10 +118,39 @@ impl Transform for DoBind {
 }
 
 impl Transform for If {
+    fn is_cexpr(&self) -> bool {
+        self.then.is_cexpr() || self.r#else.as_ref().map(Transform::is_cexpr) == Some(true)
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
+        fn transform_then(defs: &FunctionDefs, inner: TokenStream) -> syn::Result<TokenStream> {
+            match defs.then.as_ref() {
+                Some(then) => {
+                    let output = quote! {
+                        (#then)(#inner)
+                    };
+                    Ok(output)
+                },
+                None => Ok(inner),
+            }
+        }
+
+        fn transform_else(defs: &FunctionDefs, inner: TokenStream) -> syn::Result<TokenStream> {
+            match defs.r#else.as_ref() {
+                Some(r#else) => {
+                    let output = quote! {
+                        (#r#else)(#inner)
+                    };
+                    Ok(output)
+                },
+                None => Ok(inner),
+            }
+        }
+        
         let condition = self.condition;
         let if_then = self.then.transform(defs, TokenStream::new())?;
-        let output = match self.r#else {
+        let if_then = transform_then(defs, if_then)?;
+        let if_else = match self.r#else {
             None => {
                 // Get required definitions
                 let zero = defs.zero.or_error(
@@ -107,23 +159,18 @@ impl Transform for If {
                 )?;
 
                 // zero: impl Fn() -> M<T>
-                quote! {
-                    if (#condition) {
-                        #if_then
-                    } else {
-                        (#zero)()
-                    }
-                }
+                quote!((#zero)())
             }
-            Some(r#else) => {
-                let r#else = r#else.transform(defs, TokenStream::new())?;
-                quote! {
-                    if (#condition) {
-                        #if_then
-                    } else {
-                        #r#else
-                    }
-                }
+            Some(if_else) => {
+                if_else.transform(defs, TokenStream::new())?
+            }
+        };
+        let if_else = transform_else(defs, if_else)?;
+        let output = quote! {
+            if (#condition) {
+                #if_then
+            } else {
+                #if_else
             }
         };
         let output = if then.is_empty() {
@@ -137,6 +184,13 @@ impl Transform for If {
 }
 
 impl Transform for Else {
+    fn is_cexpr(&self) -> bool {
+        match self {
+            Else::ElseIf(_, inner) => inner.is_cexpr(),
+            Else::Else(_, inner) => inner.is_cexpr(),
+        }
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         let (else_token, output) = match self {
             Else::ElseIf(else_token, else_if) => {
@@ -161,6 +215,10 @@ impl Transform for Else {
 }
 
 impl Transform for Match {
+    fn is_cexpr(&self) -> bool {
+        self.arms.is_cexpr()
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         let expr = self.expr;
         let arms = self.arms.transform(defs, TokenStream::new())?;
@@ -178,6 +236,10 @@ impl Transform for Match {
 }
 
 impl Transform for MatchArms {
+    fn is_cexpr(&self) -> bool {
+        self.arms.iter().any(Transform::is_cexpr)
+    }
+
     fn transform(self, defs: &FunctionDefs, _: TokenStream) -> syn::Result<TokenStream> {
         let arms: Vec<_> = self
             .arms
@@ -193,6 +255,10 @@ impl Transform for MatchArms {
 }
 
 impl Transform for MatchArm {
+    fn is_cexpr(&self) -> bool {
+        self.body.is_cexpr()
+    }
+
     fn transform(self, defs: &FunctionDefs, _: TokenStream) -> syn::Result<TokenStream> {
         let pat = self.pat;
         let guard = self.guard.map(|(_, guard)| quote!(if #guard));
@@ -206,6 +272,10 @@ impl Transform for MatchArm {
 }
 
 impl Transform for For {
+    fn is_cexpr(&self) -> bool {
+        self.body.is_cexpr()
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         // Get required definitions
         let r#for = defs
@@ -229,6 +299,10 @@ impl Transform for For {
 }
 
 impl Transform for While {
+    fn is_cexpr(&self) -> bool {
+        self.body.is_cexpr()
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         // Get required definitions
         let r#while = defs
@@ -238,7 +312,7 @@ impl Transform for While {
         // while: impl Fn(impl Fn() -> Cond, Delayed<T>) -> M<T>
         let cond = self.condition;
         let body = self.body.transform(defs, TokenStream::new())?;
-        let body = delay(defs, self.while_token.span(), body)?;
+        let body = delay(defs, body)?;
         let output = quote! {
             (#r#while)(
                 move || { #cond },
@@ -255,6 +329,10 @@ impl Transform for While {
 }
 
 impl Transform for Loop {
+    fn is_cexpr(&self) -> bool {
+        self.body.is_cexpr()
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         // Get required definitions
         let r#loop = defs
@@ -263,7 +341,7 @@ impl Transform for Loop {
 
         // loop: impl Fn(Delayed<T>) -> M<T>
         let body = self.body.transform(defs, TokenStream::new())?;
-        let body = delay(defs, self.loop_token.span(), body)?;
+        let body = delay(defs, body)?;
         let output = quote! {
             (#r#loop)(#body)
         };
@@ -277,6 +355,10 @@ impl Transform for Loop {
 }
 
 impl Transform for Return {
+    fn is_cexpr(&self) -> bool {
+        true
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         // Get required definitions
         let r#return = defs
@@ -296,6 +378,10 @@ impl Transform for Return {
 }
 
 impl Transform for ReturnBind {
+    fn is_cexpr(&self) -> bool {
+        true
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         // Get required definitions
         let let_bind = defs.bind.or_error(
@@ -327,6 +413,10 @@ impl Transform for ReturnBind {
 }
 
 impl Transform for Yield {
+    fn is_cexpr(&self) -> bool {
+        true
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         // Get required definitions
         let r#yield = defs
@@ -346,6 +436,10 @@ impl Transform for Yield {
 }
 
 impl Transform for YieldBind {
+    fn is_cexpr(&self) -> bool {
+        true
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         // Get required definitions
         let let_bind = defs.bind.or_error(
@@ -377,6 +471,10 @@ impl Transform for YieldBind {
 }
 
 impl Transform for CExprStmt {
+    fn is_cexpr(&self) -> bool {
+        todo!()
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         match self {
             CExprStmt::Normal(stmt) => stmt.transform(defs, then),
@@ -412,6 +510,10 @@ impl Transform for CExprStmt {
 }
 
 impl Transform for CExprStmts {
+    fn is_cexpr(&self) -> bool {
+        self.stmts.iter().any(|stmt| stmt.is_cexpr())
+    }
+
     fn transform(self, defs: &FunctionDefs, then: TokenStream) -> syn::Result<TokenStream> {
         self.stmts
             .into_iter()
@@ -425,11 +527,7 @@ impl ExecuteCExpr {
         let output = self.expr.transform(&self.defs, TokenStream::new())?;
 
         // Delay if needed
-        let output = if self.defs.delay.is_some() {
-            delay(&self.defs, Span::call_site(), output)?
-        } else {
-            output
-        };
+        let output = delay(&self.defs, output)?;
 
         // Run if needed
         let output = if let Some(run) = self.defs.run.as_ref() {
@@ -444,16 +542,25 @@ impl ExecuteCExpr {
     }
 }
 
-fn delay(defs: &FunctionDefs, error_span: Span, expr: TokenStream) -> syn::Result<TokenStream> {
-    // Get required definitions
-    let delay = defs
-        .delay
-        .or_error(error_span, "Missing 'delay' definition")?;
+fn delay(defs: &FunctionDefs, expr: TokenStream) -> syn::Result<TokenStream> {
+    // Get optional definitions
+    let delay = match defs.delay.as_ref() {
+        Some(delay) => delay,
+        None => {
+            // delay: impl Fn(T) -> T
+            return Ok(quote! {
+                #expr
+            });
+        }
+    };
 
     // delay: impl Fn(impl FnOnce() -> M<T>) -> Delayed<T>
-    Ok(quote! {
-        (#delay)(move || { #expr })
-    })
+    let inner = &delay.inner;
+    if delay.modifiers.contains(DelayModifiers::MOVE) {
+        Ok(quote! { (#inner)(move || { #expr }) })
+    } else {
+        Ok(quote! { (#inner)(|| { #expr }) })
+    }
 }
 
 fn combine(
@@ -467,15 +574,7 @@ fn combine(
         .combine
         .or_error(error_span, "Missing 'combine' definition")?;
 
-    // Delay if a delay function is defined
-    let output = if defs.delay.is_some() {
-        // combine: impl Fn(M<T>, Delayed<T>) -> M<T>
-        let delayed = delay(defs, error_span, second_expr)?;
-        quote! { (#combine)({ #first_expr }, { #delayed }) }
-    } else {
-        // combine: impl Fn(M<T>, M<T>) -> M<T>
-        quote! { (#combine)({ #first_expr }, { #second_expr }) }
-    };
-
-    Ok(output)
+    // combine: impl Fn(M<T>, Delayed<T>) -> M<T>
+    let delayed = delay(defs, second_expr)?;
+    Ok(quote! { (#combine)({ #first_expr }, { #delayed }) })
 }

@@ -1,13 +1,13 @@
 use crate::types::{
-    Braced, CExprStmt, CExprStmts, DoBind, Else, ExecuteCExpr, For, FunctionDefs, If, LetBind,
-    Loop, Match, MatchArm, MatchArms, Return, ReturnBind, While, Yield, YieldBind,
+    BindModifiers, CombineModifiers, DelayModifiers, ElseModifiers, ForModifiers, LoopModifiers,
+    ReturnModifiers, RunModifiers, ThenModifiers, WhileModifiers, YieldModifiers, ZeroModifiers, Braced, CExprStmt, CExprStmts, DoBind, Else, ExecuteCExpr, For, FunctionDefs, If, LetBind, Loop, Match, MatchArm, MatchArms, Modified, Return, ReturnBind, While, Yield, YieldBind,
 };
 use proc_macro2::Span;
 use syn::{
-    braced,
+    braced, bracketed,
     ext::IdentExt,
     parse::{Parse, ParseStream},
-    token::Brace,
+    token::{Brace, Bracket},
     Expr, Ident, Lifetime, Stmt, Token,
 };
 
@@ -106,6 +106,50 @@ macro_rules! parse_kvs {
     };
 }
 
+macro_rules! parse_modifiers {
+    ($name:ty = [$(($mod_name:ident, $token:tt)),* $(,)?]) => {
+        impl Parse for $name {
+            #[allow(unreachable_code)]
+            fn parse(input: ParseStream) -> syn::Result<Self> {
+                #[allow(unused_mut)]
+                let mut modifiers = Self::empty();
+                while !input.is_empty() {
+                    let modifier = input.call(Ident::parse_any)?;
+                    #[allow(unused_variables)]
+                    let modifier = match modifier.to_string().as_str() {
+                        $(stringify!($token) => Self::$mod_name,)*
+                        _ => {
+                            let allowed_modifiers: Vec<&'static str> = vec![
+                                $(concat!("'", stringify!($token), "'"),)*
+                            ];
+                            let allowed_modifiers = if allowed_modifiers.is_empty() {
+                                format!("no modifiers allowed")
+                            } else {
+                                let allowed_modifiers = allowed_modifiers.join(", ");
+                                format!("allowed modifiers: {allowed_modifiers}")
+                            };
+                            return Err(syn::Error::new(
+                                modifier.span(),
+                                format!("Unknown modifier: '{modifier}' ({allowed_modifiers})"),
+                            ))
+                        }
+                    };
+                    modifiers |= modifier;
+
+                    // Check for comma
+                    if input.peek(Token![,]) {
+                        let _: Token![,] = input.parse()?;
+                    } else if !input.is_empty() {
+                        return Err(input.error("Expected comma."));
+                    }
+                }
+
+                Ok(modifiers)
+            }
+        }
+    };
+}
+
 impl<T: Parse> Parse for Braced<T> {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let input = {
@@ -125,16 +169,18 @@ impl Parse for FunctionDefs {
             input,
             required = {},
             optional = {
-                bind: Expr,
-                delay: Expr,
-                combine: Expr,
-                [for] r#for: Expr,
-                [while] r#while: Expr,
-                [loop] r#loop: Expr,
-                [return] r#return: Expr,
-                [yield] r#yield: Expr,
-                zero: Expr,
-                run: Expr,
+                bind: Modified<BindModifiers, Expr>,
+                delay: Modified<DelayModifiers, Expr>,
+                combine: Modified<CombineModifiers,Expr>,
+                then: Modified<ThenModifiers, Expr>,
+                [else] r#else: Modified<ElseModifiers, Expr>,
+                [for] r#for: Modified<ForModifiers, Expr>,
+                [while] r#while: Modified<WhileModifiers, Expr>,
+                [loop] r#loop: Modified<LoopModifiers, Expr>,
+                [return] r#return: Modified<ReturnModifiers, Expr>,
+                [yield] r#yield: Modified<YieldModifiers, Expr>,
+                zero: Modified<ZeroModifiers, Expr>,
+                run: Modified<RunModifiers, Expr>,
             }
         }
 
@@ -142,6 +188,8 @@ impl Parse for FunctionDefs {
             bind,
             delay,
             combine,
+            then,
+            r#else,
             r#for,
             r#while,
             r#loop,
@@ -152,6 +200,38 @@ impl Parse for FunctionDefs {
         })
     }
 }
+
+impl<M: Default + Parse, T: Parse> Parse for Modified<M, T> {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let (modifiers, modifiers_span) = if input.peek(Bracket) {
+            let content;
+            bracketed!(content in input);
+            let span = content.span();
+            (content.parse()?, Some(span))
+        } else {
+            (Default::default(), None)
+        };
+        let inner = input.parse()?;
+        Ok(Modified {
+            modifiers,
+            modifiers_span,
+            inner,
+        })
+    }
+}
+
+parse_modifiers!(BindModifiers = [(MOVE, move)]);
+parse_modifiers!(DelayModifiers = [(MOVE, move)]);
+parse_modifiers!(CombineModifiers = []);
+parse_modifiers!(ThenModifiers = []);
+parse_modifiers!(ElseModifiers = []);
+parse_modifiers!(ForModifiers = []);
+parse_modifiers!(WhileModifiers = []);
+parse_modifiers!(LoopModifiers = []);
+parse_modifiers!(ReturnModifiers = []);
+parse_modifiers!(YieldModifiers = []);
+parse_modifiers!(ZeroModifiers = []);
+parse_modifiers!(RunModifiers = []);
 
 impl Parse for LetBind {
     fn parse(input: ParseStream) -> syn::Result<Self> {
@@ -361,10 +441,7 @@ impl Parse for Yield {
         } else {
             Some(input.parse()?)
         };
-        Ok(Yield {
-            yield_token,
-            value,
-        })
+        Ok(Yield { yield_token, value })
     }
 }
 

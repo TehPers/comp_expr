@@ -1,5 +1,5 @@
-use std::{cell::RefCell, rc::Rc, borrow::Cow};
 use comp_expr::seq;
+use std::{cell::RefCell, rc::Rc};
 
 pub fn main() {
     let seq = seq! {
